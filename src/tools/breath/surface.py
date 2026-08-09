@@ -31,7 +31,7 @@ from datetime import datetime, timedelta
 from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket
-from utils import parse_bool, parse_iso_datetime
+from utils import parse_bool, parse_iso_datetime, strip_wikilinks, count_tokens_approx
 from ._verbatim import render_stored_bucket
 
 # U-07 fix: throttle the sampling-fallback INFO log to once per 5 minutes.
@@ -354,6 +354,46 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         except Exception as e:
             rt.logger.warning(f"Dream surface block failed / 偶遇模块异常: {e}")
 
+    # --- 潜流：从所有旧桶里随机浮现 1~3 条，不看权重 ---
+    # 让旧记忆每次开窗都有机会重新浮现，维持连续性。
+    undercurrent_results: list[str] = []
+    if not primary_omitted and token_budget > 500:
+        try:
+            shown_ids = {b["id"] for b in candidates}
+            uc_exclude = shown_ids | pinned_ids
+            old_pool = [
+                b for b in all_buckets
+                if b["id"] not in uc_exclude
+                and _can_surface(b)
+                and not is_letter_bucket(b)
+                and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "self", "i")
+                and not b["metadata"].get("pinned", False)
+                and not b["metadata"].get("protected", False)
+            ]
+            if old_pool:
+                n_sample = min(3, len(old_pool))
+                sampled = random.sample(old_pool, n_sample)
+                for b in sampled:
+                    if token_budget <= 200:
+                        break
+                    try:
+                        clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                        summary = await rt.dehydrator.dehydrate(
+                            strip_wikilinks(b.get("content", "")), clean_meta
+                        )
+                        summary_tokens = count_tokens_approx(summary)
+                        if summary_tokens > token_budget:
+                            break
+                        undercurrent_results.append(
+                            f"🌊 [潜流] [bucket_id:{b['id']}] {summary}"
+                        )
+                        token_budget -= summary_tokens
+                    except Exception as e:
+                        rt.logger.warning(f"Undercurrent dehydrate failed / 潜流脱水失败: {e}")
+                        continue
+        except Exception as e:
+            rt.logger.warning(f"Undercurrent block failed / 潜流模块异常: {e}")
+
     parts = []
     if core_filter_notice:
         parts.append(core_filter_notice)
@@ -365,6 +405,11 @@ async def surface_default(max_results: int, max_tokens: int, tag_filter: list) -
         parts.append("=== 久未浮现 ===\n" + "\n---\n".join(passive_results))
     if dream_results:
         parts.append("=== 偶然想起 ===\n" + "\n---\n".join(dream_results))
+    if undercurrent_results:
+        parts.append(
+            "=== 潜流 ===\n这些是从旧记忆里随机浮上来的，也许和现在有关，也许只是路过。\n"
+            + "\n---\n".join(undercurrent_results)
+        )
     if primary_omitted:
         parts.append(
             _budget_notice(
